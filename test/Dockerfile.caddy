@@ -1,0 +1,33 @@
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git
+
+# Install xcaddy
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+# Copy local plugin source
+COPY . /src/caddy-tlsconsul
+
+# Build Caddy with local caddy-tlsconsul plugin
+WORKDIR /build
+RUN xcaddy build v2.10.2 \
+    --with github.com/pteich/caddy-tlsconsul=/src/caddy-tlsconsul \
+    --output /build/caddy
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates curl
+
+COPY --from=builder /build/caddy /usr/bin/caddy
+
+# Install pebble's minica root CA into system trust store
+RUN wget -O /usr/local/share/ca-certificates/pebble-minica.crt \
+    https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem \
+    && update-ca-certificates
+
+# Create caddy user/group
+RUN addgroup -S caddy && adduser -S -G caddy caddy
+
+EXPOSE 80 443
+
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]

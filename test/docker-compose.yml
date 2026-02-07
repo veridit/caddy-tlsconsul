@@ -1,0 +1,150 @@
+services:
+  consul:
+    image: hashicorp/consul:1.15
+    command: agent -dev -client=0.0.0.0
+    ports:
+      - "8500:8500"
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.10
+
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    command:
+      - -defaultIPv4
+      - "10.30.50.20"
+      - -defaultIPv6
+      - ""
+      - -dns01
+      - ":8053"
+      - -http01
+      - ""
+      - -https01
+      - ""
+      - -tlsalpn01
+      - ""
+    ports:
+      - "8055:8055"
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.3
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command:
+      - -config
+      - /test/config/pebble-config.json
+      - -dnsserver
+      - "10.30.50.3:8053"
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_VA_ALWAYS_VALID: "0"
+    volumes:
+      - ./pebble-config.json:/test/config/pebble-config.json:ro
+    ports:
+      - "14000:14000"
+      - "15000:15000"
+    depends_on:
+      - challtestsrv
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.2
+
+  # HAProxy load balancer (L4 TLS passthrough)
+  lb:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8443:443"
+      - "8080:80"
+      - "8404:8404"
+    depends_on:
+      - caddy1
+      - caddy2
+      - caddy3
+      - caddy4
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.20
+
+  caddy1:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.caddy
+    hostname: caddy1
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./wait-for-pebble.sh:/usr/local/bin/wait-for-pebble.sh:ro
+    entrypoint: ["/usr/local/bin/wait-for-pebble.sh"]
+    environment:
+      CADDY_CLUSTERING_CONSUL_AESKEY: "consultls-1234567890-caddytls-32"
+    depends_on:
+      - consul
+      - pebble
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.31
+
+  caddy2:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.caddy
+    hostname: caddy2
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./wait-for-pebble.sh:/usr/local/bin/wait-for-pebble.sh:ro
+    entrypoint: ["/usr/local/bin/wait-for-pebble.sh"]
+    environment:
+      CADDY_CLUSTERING_CONSUL_AESKEY: "consultls-1234567890-caddytls-32"
+    depends_on:
+      - consul
+      - pebble
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.32
+
+  caddy3:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.caddy
+    hostname: caddy3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./wait-for-pebble.sh:/usr/local/bin/wait-for-pebble.sh:ro
+    entrypoint: ["/usr/local/bin/wait-for-pebble.sh"]
+    environment:
+      CADDY_CLUSTERING_CONSUL_AESKEY: "consultls-1234567890-caddytls-32"
+    depends_on:
+      - consul
+      - pebble
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.33
+
+  caddy4:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.caddy
+    hostname: caddy4
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./wait-for-pebble.sh:/usr/local/bin/wait-for-pebble.sh:ro
+    entrypoint: ["/usr/local/bin/wait-for-pebble.sh"]
+    environment:
+      CADDY_CLUSTERING_CONSUL_AESKEY: "consultls-1234567890-caddytls-32"
+    depends_on:
+      - consul
+      - pebble
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.34
+
+networks:
+  acmenet:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.30.50.0/24
