@@ -63,9 +63,13 @@ func (cs *ConsulStorage) prefixKey(key string) string {
 func (cs *ConsulStorage) Lock(ctx context.Context, key string) error {
 	cs.logger.Debugf("trying lock for %s", key)
 
-	if _, isLocked := cs.GetLock(key); isLocked {
-		return nil
-	}
+	// Do not short-circuit when this process already holds the key.
+	// certmagic only keeps a bookkeeping map of held locks and does not
+	// serialize callers in-process: obtain/renew for the same name, ARI
+	// updates or two Configs during a config reload can call Lock for the
+	// same key concurrently. Every call therefore acquires its own Consul
+	// lock (with its own session), so a second caller blocks until the
+	// first one unlocks, exactly as a caller in another process would.
 
 	// prepare the distributed lock
 	cs.logger.Infof("creating Consul lock for %s", key)
@@ -142,6 +146,11 @@ func (cs *ConsulStorage) Unlock(_ context.Context, key string) error {
 		return fmt.Errorf("lock %s not found: %w", cs.prefixKey(key), ErrLockNotFound)
 	}
 
+	// The map entry is intentionally not restored if Unlock fails: the
+	// Consul lock marks itself as not held and stops renewing its session
+	// before attempting the release, so retrying Unlock on it can only
+	// return ErrLockNotHeld. The session is destroyed on renew stop or
+	// expires after its TTL, which releases the key server-side.
 	err := lock.Unlock()
 	if err != nil {
 		return fmt.Errorf("unable to unlock %s: %w", cs.prefixKey(key), err)
