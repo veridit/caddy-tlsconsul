@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git
 
@@ -10,7 +10,7 @@ COPY . /src/caddy-tlsconsul
 
 # Build Caddy with local caddy-tlsconsul plugin
 WORKDIR /build
-RUN xcaddy build v2.10.2 \
+RUN xcaddy build v2.11.9 \
     --with github.com/pteich/caddy-tlsconsul=/src/caddy-tlsconsul \
     --output /build/caddy
 

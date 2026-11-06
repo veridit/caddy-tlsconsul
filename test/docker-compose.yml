@@ -15,7 +15,7 @@ services:
       - "10.30.50.20"
       - -defaultIPv6
       - ""
-      - -dns01
+      - -dnsserver
       - ":8053"
       - -http01
       - ""
@@ -57,7 +57,7 @@ services:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "8443:443"
-      - "8080:80"
+      - "${LB_HTTP_PORT:-8080}:80"
       - "8404:8404"
     depends_on:
       - caddy1

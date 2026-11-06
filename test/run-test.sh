@@ -193,7 +193,24 @@ echo "  With fix:    100% of challenges should succeed"
 echo "  Without fix: ~$((100 * (NODES - 1) / NODES))% of attempts need distributed serving"
 echo ""
 
+# Duplicate issuance check: each domain must be obtained exactly once cluster-wide
+DUPLICATES=$(grep 'certificate obtained successfully' "$LOGFILE" \
+    | grep -o '"identifier":"[^"]*"' | sort | uniq -d || true)
+if [ -n "$DUPLICATES" ]; then
+    echo "Duplicate issuance detected:"
+    echo "$DUPLICATES" | sed 's/^/  /'
+else
+    echo "Duplicate issuance:           none"
+fi
+echo ""
+
 rm -f "$LOGFILE"
+
+if [ "$FAIL" -ne 0 ] || [ "$CERT_OBTAINED" -ne "$TOTAL" ] || [ -n "$DUPLICATES" ]; then
+    echo "RESULT: FAIL"
+    exit 1
+fi
+echo "RESULT: PASS ($SUCCESS/$TOTAL certs, $CERT_OBTAINED issuances, no duplicates)"
 
 echo "--- Test complete ---"
 echo ""
