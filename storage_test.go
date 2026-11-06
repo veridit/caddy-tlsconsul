@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,9 +166,11 @@ func TestConsulStorage_LockUnlock(t *testing.T) {
 }
 
 // The watcher goroutine of a released lock must not release a newer lock
-// acquired for the same key. The check is server-side: after the stale
-// watcher had time to fire, Consul must still show the key as held and a
-// second, independent storage instance must be unable to acquire it.
+// acquired for the same key. A test hook parks the stale watcher of the
+// first lock until the key has been re-locked, then lets it run, so the
+// interleaving that triggers the bug happens on every run. The check is
+// server-side: Consul must still show the key as held and a second,
+// independent storage instance must be unable to acquire it.
 func TestConsulStorage_RelockSurvivesStaleWatcher(t *testing.T) {
 	cs := setupConsulEnv(t)
 	other := setupConsulEnv(t)
@@ -176,38 +179,57 @@ func TestConsulStorage_RelockSurvivesStaleWatcher(t *testing.T) {
 	other.Timeout = 1
 	lockKey := path.Join("acme", "relock.example.com", "lock")
 
-	// The stale watcher only hits the new lock if it fires after the re-Lock
-	// stored its entry, so iterate enough times to hit that window reliably.
-	for i := 0; i < 200; i++ {
-		if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
-			return
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	var once sync.Once
+	hook := func(key string) func() {
+		first := false
+		if key == lockKey {
+			once.Do(func() { first = true })
 		}
-		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
-		if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
-			return
+		if !first {
+			return func() {}
 		}
-		// give the stale watcher of the first lock time to fire
-		time.Sleep(20 * time.Millisecond)
-
-		kv, _, err := cs.ConsulClient.KV().Get(cs.prefixKey(lockKey), nil)
-		assert.NoError(t, err)
-		if !assert.True(t, kv != nil && kv.Session != "", "iteration %d: Consul shows no lock holder", i) {
-			return
-		}
-
-		// periodically also prove exclusion from an independent instance
-		if i%20 == 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-			err = other.Lock(ctx, lockKey)
-			cancel()
-			if !assert.Error(t, err, "iteration %d: second instance acquired a lock that should still be held", i) {
-				_ = other.Unlock(context.Background(), lockKey)
-				return
-			}
-		}
-
-		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
+		close(parked)
+		<-release
+		return func() { close(finished) }
 	}
+	testHookLostLock.Store(&hook)
+	t.Cleanup(func() { testHookLostLock.Store(nil) })
+
+	if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
+		return
+	}
+	assert.NoError(t, cs.Unlock(context.Background(), lockKey))
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("watcher of the first lock did not observe the lost lock")
+	}
+	if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
+		close(release)
+		return
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stale watcher did not finish")
+	}
+
+	kv, _, err := cs.ConsulClient.KV().Get(cs.prefixKey(lockKey), nil)
+	assert.NoError(t, err)
+	assert.True(t, kv != nil && kv.Session != "", "Consul shows no lock holder after the stale watcher ran")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	err = other.Lock(ctx, lockKey)
+	cancel()
+	if !assert.Error(t, err, "second instance acquired a lock that should still be held") {
+		_ = other.Unlock(context.Background(), lockKey)
+	}
+
+	_ = cs.Unlock(context.Background(), lockKey)
 }
 
 func TestConsulStorage_TwoLocks(t *testing.T) {

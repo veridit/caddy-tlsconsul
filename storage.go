@@ -9,6 +9,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -59,6 +60,16 @@ func (cs *ConsulStorage) prefixKey(key string) string {
 	return path.Join(cs.Prefix, key)
 }
 
+// testHookLostLock is only set by tests. When non-nil, the lost-lock
+// watcher calls it after its lock became inactive and before acting on it,
+// and calls the returned func once it has finished. Tests use it to park a
+// stale watcher deterministically. In production it is always nil and never
+// written, so the watcher pays one predictable nil check per lost lock and
+// its behaviour is unchanged: one atomic pointer load per lost lock, no
+// allocation, no blocking. It is atomic so tests can set and clear it
+// while watchers of earlier tests may still run, without a data race.
+var testHookLostLock atomic.Pointer[func(key string) (done func())]
+
 // Lock acquires a distributed lock for the given key or blocks until it gets one
 func (cs *ConsulStorage) Lock(ctx context.Context, key string) error {
 	cs.logger.Debugf("trying lock for %s", key)
@@ -103,6 +114,9 @@ func (cs *ConsulStorage) Lock(ctx context.Context, key string) error {
 	// be held by a newer lock, which must not be released here.
 	go func() {
 		<-lockActive
+		if hook := testHookLostLock.Load(); hook != nil {
+			defer (*hook)(key)()
+		}
 		cs.muLocks.Lock()
 		current, ok := cs.locks[key]
 		if !ok || current != lock {
