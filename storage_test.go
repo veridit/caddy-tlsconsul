@@ -165,20 +165,47 @@ func TestConsulStorage_LockUnlock(t *testing.T) {
 }
 
 // The watcher goroutine of a released lock must not release a newer lock
-// acquired for the same key.
+// acquired for the same key. The check is server-side: after the stale
+// watcher had time to fire, Consul must still show the key as held and a
+// second, independent storage instance must be unable to acquire it.
 func TestConsulStorage_RelockSurvivesStaleWatcher(t *testing.T) {
 	cs := setupConsulEnv(t)
+	other := setupConsulEnv(t)
+	// Consul's blocking lock query only observes context cancellation
+	// between waits, so keep the wait short for the expected-to-fail Lock.
+	other.Timeout = 1
 	lockKey := path.Join("acme", "relock.example.com", "lock")
 
-	for i := 0; i < 20; i++ {
-		assert.NoError(t, cs.Lock(context.Background(), lockKey))
-		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
-		assert.NoError(t, cs.Lock(context.Background(), lockKey))
-		time.Sleep(50 * time.Millisecond)
-		_, held := cs.GetLock(lockKey)
-		if !assert.True(t, held, "iteration %d: new lock was released by stale watcher", i) {
+	// The stale watcher only hits the new lock if it fires after the re-Lock
+	// stored its entry, so iterate enough times to hit that window reliably.
+	for i := 0; i < 200; i++ {
+		if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
 			return
 		}
+		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
+		if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
+			return
+		}
+		// give the stale watcher of the first lock time to fire
+		time.Sleep(20 * time.Millisecond)
+
+		kv, _, err := cs.ConsulClient.KV().Get(cs.prefixKey(lockKey), nil)
+		assert.NoError(t, err)
+		if !assert.True(t, kv != nil && kv.Session != "", "iteration %d: Consul shows no lock holder", i) {
+			return
+		}
+
+		// periodically also prove exclusion from an independent instance
+		if i%20 == 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			err = other.Lock(ctx, lockKey)
+			cancel()
+			if !assert.Error(t, err, "iteration %d: second instance acquired a lock that should still be held", i) {
+				_ = other.Unlock(context.Background(), lockKey)
+				return
+			}
+		}
+
 		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
 	}
 }
@@ -200,4 +227,36 @@ func TestConsulStorage_TwoLocks(t *testing.T) {
 
 	err = cs2.Unlock(context.Background(), lockKey)
 	assert.NoError(t, err)
+}
+
+// Two goroutines of one process (e.g. two certmagic Configs during a
+// reload) must not both hold the same key: the second Lock has to wait
+// for the first Unlock instead of returning nil immediately.
+func TestConsulStorage_SameProcessMutualExclusion(t *testing.T) {
+	cs := setupConsulEnv(t)
+	lockKey := path.Join("acme", "inprocess.example.com", "lock")
+
+	assert.NoError(t, cs.Lock(context.Background(), lockKey))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	err := cs.Lock(ctx, lockKey)
+	cancel()
+	assert.Error(t, err, "second in-process Lock must not succeed while the key is held")
+
+	acquired := make(chan error, 1)
+	go func() { acquired <- cs.Lock(context.Background(), lockKey) }()
+	select {
+	case err := <-acquired:
+		t.Fatalf("second Lock returned before Unlock: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	assert.NoError(t, cs.Unlock(context.Background(), lockKey))
+	select {
+	case err := <-acquired:
+		assert.NoError(t, err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("second Lock did not acquire after Unlock")
+	}
+	assert.NoError(t, cs.Unlock(context.Background(), lockKey))
 }
