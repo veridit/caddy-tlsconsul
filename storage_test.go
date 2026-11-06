@@ -164,6 +164,25 @@ func TestConsulStorage_LockUnlock(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// The watcher goroutine of a released lock must not release a newer lock
+// acquired for the same key.
+func TestConsulStorage_RelockSurvivesStaleWatcher(t *testing.T) {
+	cs := setupConsulEnv(t)
+	lockKey := path.Join("acme", "relock.example.com", "lock")
+
+	for i := 0; i < 20; i++ {
+		assert.NoError(t, cs.Lock(context.Background(), lockKey))
+		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
+		assert.NoError(t, cs.Lock(context.Background(), lockKey))
+		time.Sleep(50 * time.Millisecond)
+		_, held := cs.GetLock(lockKey)
+		if !assert.True(t, held, "iteration %d: new lock was released by stale watcher", i) {
+			return
+		}
+		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
+	}
+}
+
 func TestConsulStorage_TwoLocks(t *testing.T) {
 	cs := setupConsulEnv(t)
 	cs2 := setupConsulEnv(t)
@@ -172,9 +191,8 @@ func TestConsulStorage_TwoLocks(t *testing.T) {
 	err := cs.Lock(context.Background(), lockKey)
 	assert.NoError(t, err)
 
-	go time.AfterFunc(5*time.Second, func() {
-		err = cs.Unlock(context.Background(), lockKey)
-		assert.NoError(t, err)
+	time.AfterFunc(5*time.Second, func() {
+		assert.NoError(t, cs.Unlock(context.Background(), lockKey))
 	})
 
 	err = cs2.Lock(context.Background(), lockKey)
