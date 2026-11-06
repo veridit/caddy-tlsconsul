@@ -89,19 +89,29 @@ func (cs *ConsulStorage) Lock(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to acquire lock for %s: lock not held", cs.prefixKey(key))
 	}
 
-	// auto-unlock and clean list of locks in case of lost
-	go func() {
-		<-lockActive
-		err := cs.Unlock(context.Background(), key)
-		if err != nil && !errors.Is(err, ErrLockNotFound) {
-			cs.logger.Errorf("failed to release lock: %s", err)
-		}
-	}()
-
-	// save the lock
+	// save the lock before starting the watcher so the watcher sees it
 	cs.muLocks.Lock()
 	cs.locks[key] = lock
 	cs.muLocks.Unlock()
+
+	// clean up in case the lock is lost. Only act if the map still holds
+	// this exact lock instance: after an explicit Unlock the key may already
+	// be held by a newer lock, which must not be released here.
+	go func() {
+		<-lockActive
+		cs.muLocks.Lock()
+		current, ok := cs.locks[key]
+		if !ok || current != lock {
+			cs.muLocks.Unlock()
+			return
+		}
+		delete(cs.locks, key)
+		cs.muLocks.Unlock()
+		cs.logger.Warnf("lost Consul lock for %s", cs.prefixKey(key))
+		if err := lock.Unlock(); err != nil && !errors.Is(err, consul.ErrLockNotHeld) {
+			cs.logger.Errorf("failed to release lost lock %s: %s", cs.prefixKey(key), err)
+		}
+	}()
 
 	return nil
 }
@@ -120,8 +130,14 @@ func (cs *ConsulStorage) GetLock(key string) (*consul.Lock, bool) {
 
 // Unlock releases a specific lock
 func (cs *ConsulStorage) Unlock(_ context.Context, key string) error {
-	// check if we own it and unlock
-	lock, exists := cs.GetLock(key)
+	// check if we own it, remove it from the map first so the lost-lock
+	// watcher treats the release as intentional, then unlock
+	cs.muLocks.Lock()
+	lock, exists := cs.locks[key]
+	if exists {
+		delete(cs.locks, key)
+	}
+	cs.muLocks.Unlock()
 	if !exists {
 		return fmt.Errorf("lock %s not found: %w", cs.prefixKey(key), ErrLockNotFound)
 	}
@@ -130,10 +146,6 @@ func (cs *ConsulStorage) Unlock(_ context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("unable to unlock %s: %w", cs.prefixKey(key), err)
 	}
-
-	cs.muLocks.Lock()
-	delete(cs.locks, key)
-	cs.muLocks.Unlock()
 
 	return nil
 }
