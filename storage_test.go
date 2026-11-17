@@ -232,6 +232,79 @@ func TestConsulStorage_RelockSurvivesStaleWatcher(t *testing.T) {
 	_ = cs.Unlock(context.Background(), lockKey)
 }
 
+// Adapted from James Mills' timeout regression tests in prologic/caddy-tlsconsul,
+// commit 3d4a04d19767f4d8cc6e3589ba5c1c64a933cb00.
+// Our blocking LockTryOnce=false implementation must keep waiting until the
+// caller cancels, then reject the nil lock channel instead of claiming success.
+func TestConsulStorage_LockTimeoutIsNotAcquired(t *testing.T) {
+	cs := setupConsulEnv(t)
+	cs2 := setupConsulEnv(t)
+	cs2.Timeout = 1
+	lockKey := path.Join("acme", "timeout.example.com", "lock")
+
+	if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
+		return
+	}
+	defer cs.Unlock(context.Background(), lockKey)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- cs2.Lock(ctx, lockKey) }()
+	// Cross multiple configured wait windows while the holder still owns it.
+	select {
+	case err := <-result:
+		t.Fatalf("contended Lock returned before cancellation: %v", err)
+	case <-time.After(3 * time.Second):
+	}
+	cancel()
+	// The SDK observes cancellation between blocking queries, not as an
+	// immediate HTTP interrupt. Allow several one-second query windows.
+	select {
+	case err := <-result:
+		assert.Error(t, err, "cancelled Lock must not claim ownership")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Lock did not return after context cancellation")
+	}
+	_, held := cs2.GetLock(lockKey)
+	assert.False(t, held, "cancelled waiter must not retain a lock")
+}
+
+// Adapted from James Mills, prologic/caddy-tlsconsul commit
+// 3d4a04d19767f4d8cc6e3589ba5c1c64a933cb00. A short wait window must not
+// grant ownership while contended, but acquisition must succeed after release.
+func TestConsulStorage_LockWaitsBeyondTimeout(t *testing.T) {
+	cs := setupConsulEnv(t)
+	cs2 := setupConsulEnv(t)
+	cs2.Timeout = 1
+	lockKey := path.Join("acme", "wait.example.com", "lock")
+
+	if !assert.NoError(t, cs.Lock(context.Background(), lockKey)) {
+		return
+	}
+	defer cs.Unlock(context.Background(), lockKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- cs2.Lock(ctx, lockKey) }()
+	select {
+	case err := <-result:
+		t.Fatalf("Lock returned while holder still owned it: %v", err)
+	case <-time.After(3 * time.Second):
+	}
+	if !assert.NoError(t, cs.Unlock(context.Background(), lockKey)) {
+		return
+	}
+	select {
+	case err := <-result:
+		if assert.NoError(t, err) {
+			assert.NoError(t, cs2.Unlock(context.Background(), lockKey))
+		}
+	case <-ctx.Done():
+		t.Fatal("waiter did not acquire after holder released the lock")
+	}
+}
+
 func TestConsulStorage_TwoLocks(t *testing.T) {
 	cs := setupConsulEnv(t)
 	cs2 := setupConsulEnv(t)
